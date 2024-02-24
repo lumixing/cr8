@@ -3,13 +3,6 @@
 version = 3
 
 [[package]]
-name = "asm"
-version = "0.1.0"
-dependencies = [
- "plex",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23,6 +16,13 @@ name = "bit-vec"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02b4ff8b16e6076c3e14220b39fbc1fabb6737522281a388998046859400895f"
+
+[[package]]
+name = "cr8"
+version = "0.1.0"
+dependencies = [
+ "plex",
+]
 
 [[package]]
 name = "lalr"

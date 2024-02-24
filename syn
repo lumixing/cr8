@@ -1,0 +1,7 @@
+ve = d
+i = *ve
+main:
+draw v0 v1 5
+v0 += 1
+clear
+goto main

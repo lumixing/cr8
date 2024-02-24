@@ -1,7 +1,6 @@
 use crate::Token::*;
-use std::{collections::HashMap, fs};
-
 use plex::{lexer, parser};
+use std::{collections::HashMap, env, fs};
 
 // lexer
 #[derive(Debug)]
@@ -9,22 +8,32 @@ pub enum Token {
     Whitespace,
     NewLine,
     Clear,
-    Move,
+    Draw,
+    Goto,
+    Assign,
+    Increment,
+    Star,
+    Ident(String),
+    Colon,
     Register(u8),
-    Integer(u16),
-    Hex(u16),
-    Comma,
+    Int16(u16),
+    Int8(u8),
+    IRegister,
 }
 
 lexer! {
     fn next_token(tok: 'a) -> Token;
 
-    r#"\r\n"# => Token::NewLine,
     r#"[ \t]+"# => Token::Whitespace,
-    r#","# => Token::Comma,
-
-    r#"cls"# => Token::Clear,
-    r#"mov"# => Token::Move,
+    r#"\r\n"# => Token::NewLine,
+    r#"clear"# => Token::Clear,
+    r#"draw"# => Token::Draw,
+    r#"goto"# => Token::Goto,
+    r#"\+="# => Token::Increment,
+    r#"="# => Token::Assign,
+    r#"\*"# => Token::Star,
+    r#":"# => Token::Colon,
+    r#"i"# => Token::IRegister,
 
     r#"v[0-9a-f]"# => {
         let num = u8::from_str_radix(tok.trim_start_matches("v"), 16).unwrap();
@@ -32,14 +41,23 @@ lexer! {
     }
 
     r#"[0-9]+"# => {
-        let num = tok.parse().unwrap();
-        Token::Integer(num)
+        let num: u16 = tok.parse().unwrap();
+
+        match num {
+            0..=255 => Token::Int8(num as u8),
+            0..=u16::MAX => Token::Int16(num as u16),
+        }
     }
 
     r#"0x[0-9a-f]+"# => {
         let num = u16::from_str_radix(tok.trim_start_matches("0x"), 16).unwrap();
-        Token::Hex(num)
+        match num {
+            0..=255 => Token::Int8(num as u8),
+            0..=u16::MAX => Token::Int16(num as u16),
+        }
     }
+
+    r#"[a-z]+"# => Token::Ident(tok.to_string()),
 
     r#"."# => panic!("invalid token: {tok}")
 }
@@ -91,9 +109,15 @@ impl<'a> Iterator for Lexer<'a> {
 // ast
 #[derive(Debug)]
 pub enum Expr_ {
-    Number(u16),
-    MoveRegisterRegister(u8, u8),
-    MoveRegisterInteger(u8, Box<Expr>),
+    Clear,
+    AssignRegisterRegister(u8, u8),
+    AssignRegisterInteger(u8, u8),
+    AssignIRegisterInteger(u16),
+    AssignIRegisterRegisterSprite(u8),
+    DeclareLabel(String),
+    DrawIRegister(u8, u8, u8),
+    IncrementRegisterInteger(u8, u8),
+    GotoLabel(String),
 }
 
 #[derive(Debug)]
@@ -128,7 +152,7 @@ parser! {
 
     statements: Vec<Expr> {
         => vec![],
-        statements[mut st] mov[e] NewLine => {
+        statements[mut st] statement[e] NewLine => {
             st.push(e);
             st
         },
@@ -137,30 +161,47 @@ parser! {
         }
     }
 
+    statement: Expr {
+        Clear => Expr {
+            span: span!(),
+            node: Expr_::Clear
+        },
+        Register(r1) Assign Register(r2) => Expr {
+            span: span!(),
+            node: Expr_::AssignRegisterRegister(r1, r2)
+        },
+        Register(r) Assign Int8(i) => Expr {
+            span: span!(),
+            node: Expr_::AssignRegisterInteger(r, i)
+        },
+        IRegister Assign Int16(i) => Expr {
+            span: span!(),
+            node: Expr_::AssignIRegisterInteger(i)
+        },
+        IRegister Assign Star Register(r) => Expr {
+            span: span!(),
+            node: Expr_::AssignIRegisterRegisterSprite(r)
+        },
+        Ident(id) Colon => Expr {
+            span: span!(),
+            node: Expr_::DeclareLabel(id)
+        },
+        Draw Register(r1) Register(r2) Int8(i) => Expr {
+            span: span!(),
+            node: Expr_::DrawIRegister(r1, r2, i)
+        },
+        Register(r) Increment Int8(i) => Expr {
+            span: span!(),
+            node: Expr_::IncrementRegisterInteger(r, i)
+        },
+        Goto Ident(id) => Expr {
+            span: span!(),
+            node: Expr_::GotoLabel(id)
+        }
+    }
+
     nop: () {
         NewLine => {}
-    }
-
-    mov: Expr {
-        Move Register(r1) Comma Register(r2) => Expr {
-            span: span!(),
-            node: Expr_::MoveRegisterRegister(r1, r2)
-        },
-        Move Register(r) Comma num[int] => Expr {
-            span: span!(),
-            node: Expr_::MoveRegisterInteger(r, Box::new(int))
-        }
-    }
-
-    num: Expr {
-        Integer(int) => Expr {
-            span: span!(),
-            node: Expr_::Number(int)
-        },
-        Hex(int) => Expr {
-            span: span!(),
-            node: Expr_::Number(int)
-        }
     }
 }
 
@@ -170,40 +211,106 @@ pub fn parse<I: Iterator<Item = (Token, Span)>>(
     parse_(i)
 }
 
-// interp
-pub fn interp<'a>(p: &'a Program) {
-    let mut env = HashMap::new();
-    for expr in &p.statements {
-        interp_expr(&mut env, expr);
-    }
+struct Props<'a> {
+    pub pc: u16,
+    pub ins: Vec<u8>,
+    pub labels: HashMap<&'a str, u16>,
+    pub line: usize,
 }
 
-fn interp_expr<'a>(env: &mut HashMap<&'a str, i64>, expr: &'a Expr) -> i64 {
+// interp
+pub fn interp<'a>(p: &'a Program) -> Vec<u8> {
+    let mut props = Props {
+        pc: 0,
+        ins: vec![],
+        labels: HashMap::new(),
+        line: 0,
+    };
+
+    for expr in &p.statements {
+        props.pc += 2;
+        props.line += 1;
+        interp_expr(&mut props, expr);
+    }
+
+    props.ins
+}
+
+fn interp_expr<'a>(props: &mut Props<'a>, expr: &'a Expr) {
     use crate::Expr_::*;
 
     match expr.node {
-        Number(ref a) => *a as i64,
-        MoveRegisterRegister(ref a, ref b) => {
-            println!("mov v{} v{}", a, b);
-            0
+        Clear => {
+            // 00E0
+            props.ins.extend(vec![0x00, 0xE0]);
         }
-        MoveRegisterInteger(ref a, ref b) => {
-            println!("mov v{} {}", a, interp_expr(env, b));
-            0
+        AssignRegisterRegister(ref r1, ref r2) => {
+            // 8xy0
+            props.ins.extend(vec![0x80 + r1, r2 << 4]);
+        }
+        AssignRegisterInteger(ref r, ref int) => {
+            // 6xnn
+            props.ins.extend(vec![0x60 + r, *int]);
+        }
+        AssignIRegisterInteger(ref int) => {
+            // Annn
+            let high_byte = 0xD0 + ((int & 0xF00) >> 8);
+            let low_byte = int & 0x0FF;
+            props.ins.extend(vec![high_byte as u8, low_byte as u8]);
+        }
+        AssignIRegisterRegisterSprite(ref r) => {
+            // Fx1E
+            props.ins.extend(vec![0xF0 + r, 0x29]);
+        }
+        DeclareLabel(ref id) => {
+            props.labels.insert(id, props.pc);
+            props.pc -= 2;
+        }
+        DrawIRegister(ref r1, ref r2, ref int) => {
+            // Dxyn
+            props.ins.extend(vec![0xD0 + r1, (r2 << 4) + int]);
+        }
+        IncrementRegisterInteger(ref r, ref int) => {
+            // 7xnn
+            props.ins.extend(vec![0x70 + r, *int]);
+        }
+        GotoLabel(ref id) => {
+            // 1nnn
+            let Some(pc) = props.labels.get(id.as_str()) else {
+                panic!("line {}: could not find label {:?}", props.line, id);
+            };
+            let high_byte = 0x10 + ((pc & 0xF00) >> 8);
+            let low_byte = (pc + 510) & 0x0FF;
+            props.ins.extend(vec![high_byte as u8, low_byte as u8]);
         }
     }
 }
 
 fn main() {
-    let source = fs::read_to_string("test.asm").unwrap();
+    let args: Vec<String> = env::args().collect();
+    let input_path = &args[1];
+    let output_path = &args[2];
+
+    let source = fs::read_to_string(input_path).unwrap();
     // println!("{:?}", source);
+
     let lexer = Lexer::new(source.as_str());
     // for (token, _) in lexer {
     // println!("{:?}", token);
     // }
+
     let program = parse(lexer).unwrap();
-    for st in &program.statements {
-        println!("{:?}", st.node);
-    }
-    interp(&program);
+    // for st in &program.statements {
+    // println!("{:?}", st.node);
+    // }
+
+    let ins = interp(&program);
+    // println!("{:#04X?}", ins);
+
+    fs::write(output_path, ins.clone()).unwrap();
+    println!(
+        "successfully compiled {} instructions to {}",
+        ins.len(),
+        output_path
+    );
 }
